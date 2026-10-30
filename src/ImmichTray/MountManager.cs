@@ -20,6 +20,13 @@ internal sealed class MountManager : IDisposable
     private FileSystemWatcher? _watcher;
     private System.Threading.Timer? _maintainDebounce;
     private CancellationTokenSource _cts = new();
+    private readonly ChangeTracker _tracker = new();
+    private readonly object _pendingLock = new();
+    private ChangeSet? _pending;
+    private CancellationTokenSource? _quickCts;
+
+    /// <summary>How often the quick change check asks Immich what changed.</summary>
+    public static TimeSpan QuickCheckInterval { get; set; } = TimeSpan.FromSeconds(15);
 
     public MountManager(AppSettings settings)
     {
@@ -59,6 +66,7 @@ internal sealed class MountManager : IDisposable
 
     private void ResetClient()
     {
+        _tracker.Reset();
         _client?.Dispose();
         _client = null;
         _tree = null;
@@ -189,6 +197,7 @@ internal sealed class MountManager : IDisposable
         }
 
         _ = RefreshAsync(force: false);
+        StartQuickChecks();
         return true;
     }
 
@@ -198,6 +207,7 @@ internal sealed class MountManager : IDisposable
         await _gate.WaitAsync();
         try
         {
+            StopQuickChecks();
             StopWatcher();
             var path = MountedPath ?? SyncRootRegistrar.GetRegisteredPath();
             _provider?.Disconnect();
@@ -273,6 +283,7 @@ internal sealed class MountManager : IDisposable
     public void Disconnect()
     {
         _cts.Cancel();
+        StopQuickChecks();
         StopWatcher();
         _provider?.Disconnect();
         _provider = null;
@@ -284,6 +295,12 @@ internal sealed class MountManager : IDisposable
     {
         if (_sync == null || _client == null) return;
         if (!await _gate.WaitAsync(0)) return; // something else is running; the next timer tick will catch up
+        ChangeSet? changes;
+        lock (_pendingLock)
+        {
+            changes = _pending;
+            _pending = null;
+        }
         try
         {
             ServerReachable = await _client.PingAsync(_cts.Token);
@@ -293,10 +310,12 @@ internal sealed class MountManager : IDisposable
                 return;
             }
             if (State == MountState.Mounted) SetState(MountState.Mounted, "Refreshing");
+            if (changes == null) SyncRootRegistrar.EnsureThumbnailProvider(); // regular refreshes only
             _provider?.ClearListingCache();
-            await _sync.RefreshAsync(force, _cts.Token);
+            await _sync.RefreshAsync(force || changes?.Everything == true, changes, _cts.Token);
+            changes = null;
             LastRefresh = DateTime.Now;
-            await _sync.MaintainFilesAsync(LimitBytes, _cts.Token);
+            await _sync.MaintainFilesAsync(LimitBytes, FreeUnusedAfter, _cts.Token);
             if (State == MountState.Mounted) SetState(MountState.Mounted, "Connected");
         }
         catch (OperationCanceledException) { }
@@ -307,11 +326,71 @@ internal sealed class MountManager : IDisposable
         }
         finally
         {
+            if (changes != null) Queue(changes); // not done: try those folders again next time
             _gate.Release();
         }
     }
 
     private long? LimitBytes => Settings.CacheLimitEnabled ? Math.Max(1, Settings.CacheLimitGb) * 1024L * 1024 * 1024 : null;
+
+    private TimeSpan? FreeUnusedAfter => Settings.FreeUnusedEnabled ? TimeSpan.FromDays(Math.Max(1, Settings.FreeUnusedDays)) : null;
+
+    private void Queue(ChangeSet changes)
+    {
+        lock (_pendingLock) _pending = changes.Merge(_pending);
+    }
+
+    // ------------------------------------------------------------------ quick change checks
+
+    private void StartQuickChecks()
+    {
+        StopQuickChecks();
+        _quickCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        _ = QuickCheckLoopAsync(_quickCts.Token);
+    }
+
+    private void StopQuickChecks()
+    {
+        _quickCts?.Cancel();
+        _quickCts?.Dispose();
+        _quickCts = null;
+    }
+
+    private async Task QuickCheckLoopAsync(CancellationToken ct)
+    {
+        var failures = 0;
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(QuickCheckInterval, ct); }
+            catch (OperationCanceledException) { return; }
+
+            var client = _client;
+            if (!Settings.QuickChecks || client == null || _sync == null || State != MountState.Mounted) continue;
+            try
+            {
+                var changes = await _tracker.CheckAsync(client, Settings.Views.Albums, ct);
+                if (failures > 0) Log.Info("Quick change checks are working again");
+                failures = 0;
+                if (changes != null)
+                {
+                    Log.Info(changes.Everything
+                        ? "Immich: many changes, checking every open folder"
+                        : changes.AssetCount == 0 ? "Immich: albums changed"
+                        : $"Immich: {changes.AssetCount} photos changed{(changes.AlbumListChanged ? ", albums changed" : "")}");
+                    Queue(changes);
+                }
+                bool pending;
+                lock (_pendingLock) pending = _pending != null;
+                if (pending) await RefreshAsync(force: false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex)
+            {
+                // Server down or busy: say so once, keep trying quietly. The regular refresh still runs.
+                if (failures++ == 0) Log.Warn("Quick change check failed", ex);
+            }
+        }
+    }
 
     // ------------------------------------------------------------------ pin / free-up watcher
 
@@ -352,7 +431,7 @@ internal sealed class MountManager : IDisposable
     {
         var sync = _sync;
         if (sync == null) return;
-        try { await sync.MaintainFilesAsync(LimitBytes, _cts.Token); }
+        try { await sync.MaintainFilesAsync(LimitBytes, FreeUnusedAfter, _cts.Token); }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Log.Warn("File maintenance failed", ex); }
     }

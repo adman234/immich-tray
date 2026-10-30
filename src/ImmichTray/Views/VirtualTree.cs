@@ -319,6 +319,10 @@ public sealed class VirtualTree
 
     // ------------------------------------------------------------------ helpers
 
+    /// <summary>The Timeline month folder a photo lands in, e.g. "Timeline\2026\10 - October".</summary>
+    public static string MonthFolderPath(DateTime local) =>
+        $"{TimelineFolder}\\{local.Year.ToString(CultureInfo.InvariantCulture)}\\{MonthFolderName(local.Month)}";
+
     public static string MonthFolderName(int month) =>
         $"{month:00} - {CultureInfo.InvariantCulture.DateTimeFormat.GetMonthName(month)}";
 

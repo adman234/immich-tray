@@ -47,6 +47,12 @@ public sealed record AssetQuery
     public int? Limit { get; init; }
 }
 
+/// <summary>
+/// Assets changed on the server since a point in time. <see cref="More"/> means there were
+/// too many to list. <see cref="ServerTime"/> is the server's clock (from the HTTP Date header).
+/// </summary>
+public sealed record ChangeBatch(IReadOnlyList<Asset> Assets, bool More, DateTimeOffset? ServerTime);
+
 public sealed class ImmichApiException(int status, string message) : Exception(message)
 {
     public int Status { get; } = status;

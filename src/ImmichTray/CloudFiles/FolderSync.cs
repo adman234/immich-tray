@@ -42,6 +42,38 @@ internal sealed class SyncState
     }
 }
 
+/// <summary>When each downloaded file was first seen downloaded (full path to UTC time).</summary>
+internal static class DownloadLog
+{
+    private static string FilePath => Path.Combine(AppInfo.DataDir, "downloads.json");
+
+    public static Dictionary<string, DateTime> Load()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+            {
+                var d = JsonSerializer.Deserialize<Dictionary<string, DateTime>>(File.ReadAllText(FilePath));
+                if (d != null) return new Dictionary<string, DateTime>(d, StringComparer.OrdinalIgnoreCase);
+            }
+        }
+        catch (Exception ex) { Log.Warn("Could not read the download log", ex); }
+        return new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static void Save(Dictionary<string, DateTime> entries)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppInfo.DataDir);
+            var tmp = FilePath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(entries));
+            File.Move(tmp, FilePath, overwrite: true);
+        }
+        catch (Exception ex) { Log.Warn("Could not save the download log", ex); }
+    }
+}
+
 /// <summary>
 /// Keeps folders that have already been opened in step with Immich, and looks after
 /// downloaded files (pinning, freeing space, the optional size limit).
@@ -53,6 +85,7 @@ internal sealed class FolderSync
     private readonly DirectoryLocks _locks;
     private readonly SyncState _state;
     private readonly SemaphoreSlim _hydrations = new(3, 3);
+    private readonly SemaphoreSlim _maintainGate = new(1, 1);
 
     public FolderSync(string root, VirtualTree tree, DirectoryLocks locks, SyncState state)
     {
@@ -64,7 +97,8 @@ internal sealed class FolderSync
 
     // ------------------------------------------------------------------ refresh
 
-    public async Task RefreshAsync(bool force, CancellationToken ct)
+    /// <param name="changes">From a quick check: folders to list again even if their signature looks unchanged.</param>
+    public async Task RefreshAsync(bool force, ChangeSet? changes, CancellationToken ct)
     {
         var fingerprint = _tree.Settings.ContentFingerprint;
         if (_state.Fingerprint != fingerprint)
@@ -79,7 +113,13 @@ internal sealed class FolderSync
         var diffed = 0;
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        await DiffAsync("", ct);
+        if (await DiffAsync("", ct) && !Placeholders.IsPopulatedDirectory(_root))
+        {
+            // The top level is filled in here rather than by Explorer asking, so say it's complete.
+            // Otherwise listing it (e.g. by the uninstaller after the app has quit) fails.
+            var hr = Placeholders.MarkPopulated(_root);
+            if (hr < 0) Log.Warn($"Could not mark the top folder as complete (0x{hr:X8})");
+        }
         var queue = new Queue<string>(SubDirs(""));
         while (queue.Count > 0)
         {
@@ -93,7 +133,7 @@ internal sealed class FolderSync
             try { sig = await _tree.GetSignatureAsync(rel, ct); }
             catch (Exception ex) when (ex is not OperationCanceledException) { Log.Warn($"Signature for '{rel}' failed", ex); }
 
-            if (force || sig == null || !_state.Signatures.TryGetValue(rel, out var old) || old != sig)
+            if (force || sig == null || changes?.Affects(rel) == true || !_state.Signatures.TryGetValue(rel, out var old) || old != sig)
             {
                 if (await DiffAsync(rel, ct))
                 {
@@ -206,10 +246,15 @@ internal sealed class FolderSync
             }
             if (File.Exists(path))
             {
-                if (!Placeholders.IsPlaceholder(path)) return false;
+                if (!Placeholders.IsPlaceholder(path))
+                {
+                    Log.Info($"Kept {path}: not ours (attributes {File.GetAttributes(path)}, state 0x{Placeholders.GetState(path):X})");
+                    return false;
+                }
                 File.SetAttributes(path, FileAttributes.Normal);
                 File.Delete(path);
-                return true;
+                if (File.Exists(path)) Log.Warn($"Deleting {path} did not take effect");
+                return !File.Exists(path);
             }
             return true;
         }
@@ -224,14 +269,24 @@ internal sealed class FolderSync
 
     /// <summary>
     /// Downloads files marked "Always keep on this device", frees files marked
-    /// "Free up space", and enforces the optional size limit.
+    /// "Free up space", frees photos not opened for a while, and enforces the size limit.
     /// </summary>
-    public async Task MaintainFilesAsync(long? limitBytes, CancellationToken ct)
+    public async Task MaintainFilesAsync(long? limitBytes, TimeSpan? freeUnusedAfter, CancellationToken ct)
+    {
+        await _maintainGate.WaitAsync(ct);
+        try { await MaintainCoreAsync(limitBytes, freeUnusedAfter, ct); }
+        finally { _maintainGate.Release(); }
+    }
+
+    private async Task MaintainCoreAsync(long? limitBytes, TimeSpan? freeUnusedAfter, CancellationToken ct)
     {
         var toHydrate = new List<string>();
         var toDehydrate = new List<string>();
-        var cached = new List<(string Path, long Size, DateTime Access)>();
+        var cached = new List<(string Path, long Size, DateTime LastUsed)>();
         long cachedTotal = 0;
+        var now = DateTime.UtcNow;
+        var downloads = DownloadLog.Load();
+        var stillDownloaded = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
         void Walk(string dir, bool parentPinned)
         {
@@ -264,7 +319,12 @@ internal sealed class FolderSync
                 else if (hydrated && !pinned)
                 {
                     var size = ((FileInfo)item).Length;
-                    cached.Add((item.FullName, size, item.LastAccessTimeUtc));
+                    // Last access time alone isn't reliable (Windows can turn its updates off),
+                    // so also count from when this app first saw the file downloaded.
+                    if (!downloads.TryGetValue(item.FullName, out var firstSeen)) firstSeen = now;
+                    stillDownloaded[item.FullName] = firstSeen;
+                    var lastUsed = item.LastAccessTimeUtc > firstSeen ? item.LastAccessTimeUtc : firstSeen;
+                    cached.Add((item.FullName, size, lastUsed));
                     cachedTotal += size;
                 }
             }
@@ -277,16 +337,39 @@ internal sealed class FolderSync
             if (Placeholders.Dehydrate(path)) Placeholders.ClearPin(path);
         }
 
+        if (freeUnusedAfter is TimeSpan age)
+        {
+            var cutoff = now - age;
+            int count = 0;
+            long bytes = 0;
+            foreach (var f in cached.Where(c => c.LastUsed < cutoff).ToList())
+            {
+                if (!Placeholders.Dehydrate(f.Path)) continue;
+                count++;
+                bytes += f.Size;
+                cachedTotal -= f.Size;
+                cached.Remove(f);
+                stillDownloaded.Remove(f.Path);
+            }
+            if (count > 0) Log.Info($"Freed {count} photos not opened in {age.TotalDays:0} days ({bytes / (1024.0 * 1024):0.0} MB)");
+        }
+
         if (limitBytes is long limit && cachedTotal > limit)
         {
             var freed = 0L;
-            foreach (var f in cached.OrderBy(c => c.Access))
+            foreach (var f in cached.OrderBy(c => c.LastUsed))
             {
                 if (cachedTotal - freed <= limit) break;
-                if (Placeholders.Dehydrate(f.Path)) freed += f.Size;
+                if (Placeholders.Dehydrate(f.Path))
+                {
+                    freed += f.Size;
+                    stillDownloaded.Remove(f.Path);
+                }
             }
             Log.Info($"Size limit: freed {freed / (1024 * 1024)} MB of downloaded files");
         }
+
+        DownloadLog.Save(stillDownloaded);
 
         if (toHydrate.Count > 0)
         {

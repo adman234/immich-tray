@@ -5,6 +5,7 @@ A small fake Immich server (v3.3 search API) for testing Immich Tray without a r
 
 API key: "test-key". Only the endpoints Immich Tray uses are implemented.
 Add/remove assets while it runs with:  POST /mock/add?month=2026-10[&count=N][&name=X]  /  POST /mock/delete?id=<uuid>
+  POST /mock/trash?id=<uuid>  /  POST /mock/album-add?album=<name>&id=<uuid>
 """
 import argparse
 import datetime as dt
@@ -37,6 +38,20 @@ def iso(d):
     return d.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def iso_ms(d):
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
+
+
+def parse_iso(raw):
+    return dt.datetime.strptime(raw.rstrip("Z")[:23], "%Y-%m-%dT%H:%M:%S.%f")
+
+
+def touch(a):
+    # Like Immich: stored with microseconds, sent with milliseconds.
+    a["upd"] = dt.datetime.utcnow()
+    a["updated"] = iso_ms(a["upd"])
+
+
 def add_asset(n, name, taken, *, kind="IMAGE", owner=ME, favorite=False, visibility="timeline",
               trashed=False, live_video=None, size_known=True, offset_hours=-5):
     media = MEDIA[n % len(MEDIA)] if kind == "IMAGE" else b"\x00\x00\x00\x18ftypmp42" + os.urandom(200_000)
@@ -44,8 +59,8 @@ def add_asset(n, name, taken, *, kind="IMAGE", owner=ME, favorite=False, visibil
     ASSETS[aid] = dict(
         id=aid, name=name, taken=taken, kind=kind, owner=owner, favorite=favorite, visibility=visibility,
         trashed=trashed, live=live_video, size_known=size_known, data=media, offset=offset_hours,
-        updated=iso(dt.datetime.utcnow()),
     )
+    touch(ASSETS[aid])
     return aid
 
 
@@ -121,6 +136,11 @@ def matches(a, f):
     tr = f.get("trashedAt")
     if tr is not None and "eq" in tr and tr["eq"] is None and a["trashed"]: return False
     if "takenAt" in f and not date_ok(a["taken"], f["takenAt"]): return False
+    if "updatedAt" in f:
+        for op, raw in f["updatedAt"].items():
+            ref = parse_iso(raw)
+            if op == "gt" and not a["upd"] > ref: return False
+            if op == "gte" and not a["upd"] >= ref: return False
     if "isFavorite" in f and a["favorite"] != f["isFavorite"]["eq"]: return False
     if "albumIds" in f:
         wanted = f["albumIds"].get("any", [])
@@ -244,6 +264,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"id": ids[0], "ids": ids})
                 if u.path == "/mock/delete":
                     ASSETS.pop(q["id"], None)
+                    return self.send_json({"ok": True})
+                if u.path == "/mock/trash":
+                    a = ASSETS[q["id"]]
+                    a["trashed"] = True
+                    touch(a)
+                    return self.send_json({"ok": True})
+                if u.path == "/mock/album-add":
+                    al = next(x for x in ALBUMS.values() if x["name"] == q["album"])
+                    al["assets"].add(q["id"])
+                    al["updated"] = iso_ms(dt.datetime.utcnow())
                     return self.send_json({"ok": True})
             return self.send_json({"message": "bad mock call"}, 400)
         if not self.auth():

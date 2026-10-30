@@ -185,13 +185,14 @@ internal sealed class ThumbnailServer : IDisposable
     private readonly ManualResetEventSlim _stop = new();
     private uint _cookie;
 
-    public ThumbnailServer(Func<IImmichClient?> client)
+    public ThumbnailServer(Func<IImmichClient?> client, bool enabled = true)
     {
         // A dedicated multi-threaded COM thread, so thumbnail calls never wait on the UI thread.
         _thread = new Thread(() =>
         {
             try
             {
+                if (!enabled) { _stop.Wait(); return; }
                 var clsid = AppInfo.ThumbnailProviderClsid;
                 var hr = CoRegisterClassObject(ref clsid, new ThumbnailClassFactory(client), CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE, out _cookie);
                 if (hr < 0) Log.Warn($"CoRegisterClassObject returned 0x{hr:X8}");

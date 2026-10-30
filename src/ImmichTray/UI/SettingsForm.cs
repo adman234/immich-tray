@@ -34,6 +34,9 @@ internal sealed class SettingsForm : Form
     private readonly RadioButton _mountReachable = new() { Text = "When the Immich server can be reached", AutoSize = true };
     private readonly RadioButton _mountManual = new() { Text = "Only when I choose Mount in the tray menu", AutoSize = true };
     private readonly NumericUpDown _refresh = new() { Minimum = 1, Maximum = 1440, Width = 70 };
+    private readonly CheckBox _quick = new() { Text = "Show new and changed photos within about 15 seconds", AutoSize = true };
+    private readonly CheckBox _freeUnused = new() { Text = "Free up photos I haven't opened in", AutoSize = true };
+    private readonly NumericUpDown _freeDays = new() { Minimum = 1, Maximum = 3650, Width = 70 };
     private readonly CheckBox _limit = new() { Text = "Limit downloaded files to", AutoSize = true };
     private readonly NumericUpDown _limitGb = new() { Minimum = 1, Maximum = 100000, Width = 80 };
 
@@ -77,7 +80,7 @@ internal sealed class SettingsForm : Form
         Padding = new Padding(10);
         ShowInTaskbar = true;
 
-        var tabs = new TabControl { Width = 600, Height = 540 };
+        var tabs = new TabControl { Width = 600, Height = 580 };
         tabs.TabPages.Add(Page("Connection", BuildConnection()));
         tabs.TabPages.Add(Page("Folder", BuildFolder()));
         tabs.TabPages.Add(Page("Layout", BuildLayout()));
@@ -102,9 +105,31 @@ internal sealed class SettingsForm : Form
         Controls.Add(root);
 
         LoadValues();
+
+        // The startup switch applies right away (no Save needed) and stays in step with the tray menu.
+        _autostart.Click += (_, _) => ApplyAutostart();
+        AutoStart.Changed += ShowAutostart;
+        FormClosed += (_, _) => AutoStart.Changed -= ShowAutostart;
+        Activated += (_, _) => ShowAutostart();
     }
 
     internal TabControl Tabs { get; }
+
+    private void ApplyAutostart()
+    {
+        try { AutoStart.Set(_autostart.Checked); }
+        catch (Exception ex)
+        {
+            Log.Warn("Could not change the startup setting", ex);
+            MessageBox.Show(this, "Could not change the startup setting: " + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        ShowAutostart();
+    }
+
+    private void ShowAutostart()
+    {
+        try { _autostart.Checked = AutoStart.IsEnabled; } catch { }
+    }
 
     private static TabPage Page(string title, Control content)
     {
@@ -192,12 +217,14 @@ internal sealed class SettingsForm : Form
         col.Controls.Add(_mountManual);
 
         col.Controls.Add(Heading("Check for new photos"));
-        col.Controls.Add(Row(new Label { Text = "Every" }, _refresh, new Label { Text = "minutes" }));
-        col.Controls.Add(Note("Only folders you have opened are checked. \"Refresh now\" in the tray menu checks right away."));
+        col.Controls.Add(_quick);
+        col.Controls.Add(Row(new Label { Text = "Also re-check every open folder every" }, _refresh, new Label { Text = "minutes" }));
+        col.Controls.Add(Note("Only folders you have opened are checked. Albums other people add to show up on the regular re-check. \"Refresh now\" in the tray menu checks right away."));
 
         col.Controls.Add(Heading("Disk space"));
+        col.Controls.Add(Row(_freeUnused, _freeDays, new Label { Text = "days" }));
         col.Controls.Add(Row(_limit, _limitGb, new Label { Text = "GB" }));
-        col.Controls.Add(Note("When downloaded photos go over the limit, the ones you opened longest ago are freed (they stay visible and download again when opened). Files marked \"Always keep on this device\" are never freed."));
+        col.Controls.Add(Note("Opening a photo saves a copy on this PC. Freed photos stay in the folder and download again when opened. Files marked \"Always keep on this device\" are never freed."));
         return col;
     }
 
@@ -240,6 +267,7 @@ internal sealed class SettingsForm : Form
         var col = Column();
         col.Controls.Add(Heading("Startup"));
         col.Controls.Add(_autostart);
+        col.Controls.Add(Note("Same switch as Start with Windows in the tray menu. Changes take effect right away."));
 
         col.Controls.Add(Heading("Updates"));
         col.Controls.Add(Note($"You have version {AppInfo.Version}. Updates come from GitHub releases and only install when you ask."));
@@ -275,6 +303,9 @@ internal sealed class SettingsForm : Form
         _mountReachable.Checked = _settings.MountMode == MountMode.WhenReachable;
         _mountManual.Checked = _settings.MountMode == MountMode.Manual;
         _refresh.Value = Math.Clamp(_settings.RefreshMinutes, 1, 1440);
+        _quick.Checked = _settings.QuickChecks;
+        _freeUnused.Checked = _settings.FreeUnusedEnabled;
+        _freeDays.Value = Math.Clamp(_settings.FreeUnusedDays, 1, 3650);
         _limit.Checked = _settings.CacheLimitEnabled;
         _limitGb.Value = Math.Clamp(_settings.CacheLimitGb, 1, 100000);
 
@@ -296,7 +327,7 @@ internal sealed class SettingsForm : Form
         _nameOriginal.Checked = _settings.Naming == FileNaming.Original;
         _nameDate.Checked = _settings.Naming == FileNaming.DateTaken;
 
-        try { _autostart.Checked = AutoStart.IsEnabled; } catch { }
+        ShowAutostart();
     }
 
     private AppSettings ReadValues()
@@ -307,6 +338,9 @@ internal sealed class SettingsForm : Form
         s.MountFolder = string.IsNullOrWhiteSpace(_folder.Text) ? AppInfo.DefaultMountFolder : _folder.Text.Trim();
         s.MountMode = _mountReachable.Checked ? MountMode.WhenReachable : _mountManual.Checked ? MountMode.Manual : MountMode.AppStart;
         s.RefreshMinutes = (int)_refresh.Value;
+        s.QuickChecks = _quick.Checked;
+        s.FreeUnusedEnabled = _freeUnused.Checked;
+        s.FreeUnusedDays = (int)_freeDays.Value;
         s.CacheLimitEnabled = _limit.Checked;
         s.CacheLimitGb = (int)_limitGb.Value;
         s.Views = new ViewSettings
@@ -349,9 +383,6 @@ internal sealed class SettingsForm : Form
                 return;
             }
         }
-
-        try { AutoStart.Set(_autostart.Checked); }
-        catch (Exception ex) { Log.Warn("Could not change the startup setting", ex); }
 
         save.Enabled = false;
         UseWaitCursor = true;

@@ -16,13 +16,33 @@ internal static class AppInfo
 
     public static string ExePath => Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "ImmichTray.exe");
 
+    /// <summary>
+    /// For development only: IMMICHTRAY_PROFILE=name runs a separate copy with its own settings,
+    /// data, Explorer folder and single-instance lock, so it can be tested next to an installed copy.
+    /// It never touches the installed copy's startup entry or thumbnail provider.
+    /// </summary>
+    public static string? Profile { get; } = ReadProfile();
+
+    public static bool IsTestProfile => Profile != null;
+
+    /// <summary>"" normally, "-name" for a test profile. Added to folder and lock names.</summary>
+    public static string ProfileSuffix => Profile == null ? "" : "-" + Profile;
+
+    private static string? ReadProfile()
+    {
+        var raw = Environment.GetEnvironmentVariable("IMMICHTRAY_PROFILE");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var clean = new string(raw.Trim().Where(char.IsAsciiLetterOrDigit).ToArray());
+        return clean.Length == 0 || clean.Equals("default", StringComparison.OrdinalIgnoreCase) ? null : clean;
+    }
+
     /// <summary>Roaming settings folder (settings.json).</summary>
     public static string SettingsDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ProviderName);
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ProviderName + ProfileSuffix);
 
     /// <summary>Local data folder (logs, sync state, update downloads).</summary>
     public static string DataDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), ProviderName);
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), ProviderName + ProfileSuffix);
 
     public static string LogDir => Path.Combine(DataDir, "logs");
 
@@ -32,7 +52,7 @@ internal static class AppInfo
     public static string UserSid => WindowsIdentity.GetCurrent().User?.Value ?? "S-0";
 
     /// <summary>Sync root id in the format Windows expects: provider!SID!account.</summary>
-    public static string SyncRootId => $"{ProviderName}!{UserSid}!default";
+    public static string SyncRootId => $"{ProviderName}!{UserSid}!{Profile ?? "default"}";
 
     public static string Version
     {

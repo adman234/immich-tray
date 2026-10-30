@@ -6,9 +6,9 @@ namespace ImmichTray;
 
 internal static class Program
 {
-    private const string MutexName = @"Local\ImmichTray.SingleInstance";
-    private const string ShowEventName = @"Local\ImmichTray.Show";
-    private const string QuitEventName = @"Local\ImmichTray.Quit";
+    private static readonly string MutexName = @"Local\ImmichTray.SingleInstance" + AppInfo.ProfileSuffix;
+    private static readonly string ShowEventName = @"Local\ImmichTray.Show" + AppInfo.ProfileSuffix;
+    private static readonly string QuitEventName = @"Local\ImmichTray.Quit" + AppInfo.ProfileSuffix;
 
     [STAThread]
     private static int Main(string[] args)
@@ -117,8 +117,11 @@ internal static class Program
         {
             Log.Error("Removing the Immich folder failed", ex);
         }
-        SyncRootRegistrar.UnregisterThumbnailClass();
-        try { AutoStart.Set(false); } catch { }
+        if (!AppInfo.IsTestProfile)
+        {
+            SyncRootRegistrar.UnregisterThumbnailClass();
+            try { AutoStart.Set(false); } catch { }
+        }
         Log.Info("Uninstall cleanup done");
         return 0;
     }

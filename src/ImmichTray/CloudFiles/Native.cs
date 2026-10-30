@@ -35,6 +35,7 @@ internal static unsafe class Native
 
     public const uint CF_UPDATE_FLAG_MARK_IN_SYNC = 0x2;
     public const uint CF_UPDATE_FLAG_DEHYDRATE = 0x4;
+    public const uint CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION = 0x10;
 
     public const uint CF_OPEN_FILE_FLAG_EXCLUSIVE = 0x1;
     public const uint CF_OPEN_FILE_FLAG_WRITE_ACCESS = 0x2;

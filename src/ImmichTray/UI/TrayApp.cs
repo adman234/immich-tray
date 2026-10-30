@@ -34,7 +34,7 @@ internal sealed class TrayApp : ApplicationContext, ISettingsHost
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         Manager = new MountManager(SettingsStore.Load());
         Manager.Changed += () => _ui.Post(_ => UpdateStatus(), null);
-        _thumbnails = new ThumbnailServer(() => Manager.Client);
+        _thumbnails = new ThumbnailServer(() => Manager.Client, enabled: !AppInfo.IsTestProfile);
 
         _menu.Items.Add(_status);
         _menu.Items.Add(new ToolStripSeparator());
@@ -74,7 +74,15 @@ internal sealed class TrayApp : ApplicationContext, ISettingsHost
         ResetTimer();
         UpdateStatus();
 
-        AutoStart.RefreshPathIfEnabled();
+        if (AppInfo.IsTestProfile)
+        {
+            _autostart.Enabled = false;
+            _icon.Text = $"{AppInfo.ProductName} (test profile {AppInfo.Profile})";
+        }
+        else
+        {
+            AutoStart.RefreshPathIfEnabled();
+        }
         _ui.Post(async _ =>
         {
             if (!Manager.Settings.IsConfigured) ShowSettings();

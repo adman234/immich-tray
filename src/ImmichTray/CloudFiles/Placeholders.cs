@@ -165,6 +165,26 @@ internal static unsafe class Placeholders
     }
 
     /// <summary>Frees the local copy of a downloaded file. Returns false if it is in use.</summary>
+    /// <summary>
+    /// Tells Windows a folder's contents are all on disk, so listing it never needs this app.
+    /// Returns the HRESULT.
+    /// </summary>
+    public static int MarkPopulated(string dir)
+    {
+        var hr = CfOpenFileWithOplock(dir, CF_OPEN_FILE_FLAG_WRITE_ACCESS, out var protectedHandle);
+        if (hr < 0) return hr;
+        try
+        {
+            var handle = CfGetWin32HandleFromProtectedHandle(protectedHandle);
+            return CfUpdatePlaceholder(handle, null, null, 0, IntPtr.Zero, 0,
+                CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION, IntPtr.Zero, IntPtr.Zero);
+        }
+        finally
+        {
+            CfCloseHandle(protectedHandle);
+        }
+    }
+
     public static bool Dehydrate(string path)
     {
         if (CfOpenFileWithOplock(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE, out var protectedHandle) < 0) return false;

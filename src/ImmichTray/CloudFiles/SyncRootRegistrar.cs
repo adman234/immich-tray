@@ -28,7 +28,39 @@ internal static class SyncRootRegistrar
         {
             Log.Warn("Could not list sync roots", ex);
         }
+
+        // Windows leaves some registered folders out of that list (seen for a folder under AppData),
+        // so also read the registration itself.
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"{SyncRootManagerKey}\{AppInfo.SyncRootId}\UserSyncRoots");
+            if (key?.GetValue(AppInfo.UserSid) is string path && path.Length > 0) return path;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Could not read the sync root registration", ex);
+        }
         return null;
+    }
+
+    /// <summary>Puts the thumbnail provider registration back if something removed it.</summary>
+    public static void EnsureThumbnailProvider()
+    {
+        if (AppInfo.IsTestProfile) return;
+        try
+        {
+            using var server = Registry.CurrentUser.OpenSubKey($@"Software\Classes\CLSID\{AppInfo.ThumbnailProviderClsid:B}\LocalServer32");
+            using var root = Registry.LocalMachine.OpenSubKey($@"{SyncRootManagerKey}\{AppInfo.SyncRootId}");
+            var serverOk = server?.GetValue("") as string == $"\"{AppInfo.ExePath}\"";
+            var rootOk = root == null || root.GetValue("ThumbnailProvider") is string;
+            if (serverOk && rootOk) return;
+            Log.Info("Thumbnail provider registration was missing; restoring it");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Could not check the thumbnail provider registration", ex);
+        }
+        RegisterThumbnailProvider();
     }
 
     public static async Task RegisterAsync(string path)
@@ -39,7 +71,7 @@ internal static class SyncRootRegistrar
         {
             Id = AppInfo.SyncRootId,
             Path = folder,
-            DisplayNameResource = "Immich",
+            DisplayNameResource = AppInfo.IsTestProfile ? $"Immich ({AppInfo.Profile})" : "Immich",
             IconResource = AppInfo.ExePath + ",0",
             HydrationPolicy = StorageProviderHydrationPolicy.Progressive,
             HydrationPolicyModifier = StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
@@ -76,6 +108,7 @@ internal static class SyncRootRegistrar
     /// </summary>
     public static void RegisterThumbnailProvider()
     {
+        if (AppInfo.IsTestProfile) return; // the COM class is shared with the installed copy
         var clsid = AppInfo.ThumbnailProviderClsid.ToString("B");
         try
         {

@@ -19,6 +19,11 @@ public interface IImmichClient
     Task<IReadOnlyList<Person>> GetPeopleAsync(CancellationToken ct = default);
     Task<Asset> GetAssetAsync(string id, CancellationToken ct = default);
     Task<long> GetTotalAssetCountAsync(bool includeArchived, CancellationToken ct = default);
+    /// <summary>
+    /// Assets whose updatedAt is after <paramref name="since"/> (uploads, edits, trash and restore all
+    /// bump it). With no <paramref name="since"/> it only reads the server's clock.
+    /// </summary>
+    Task<ChangeBatch> GetChangesSinceAsync(DateTimeOffset? since, CancellationToken ct = default);
     /// <summary>Opens the original file starting at <paramref name="offset"/>. Caller disposes.</summary>
     Task<Stream> OpenOriginalAsync(string id, long offset, long? endExclusive, CancellationToken ct = default);
     Task<long?> GetOriginalSizeAsync(string id, CancellationToken ct = default);
@@ -201,6 +206,44 @@ public sealed class ImmichClient : IImmichClient, IDisposable
             cursor = assetsEl.TryGetProperty("nextCursor", out var nc) && nc.ValueKind == JsonValueKind.String ? nc.GetString() : null;
             if (cursor == null) yield break;
             if (query.Limit is int l && returned >= l) yield break;
+        }
+    }
+
+    public const int ChangePageSize = 500;
+
+    public async Task<ChangeBatch> GetChangesSinceAsync(DateTimeOffset? since, CancellationToken ct = default)
+    {
+        HttpRequestMessage req;
+        if (since is not { } from)
+        {
+            req = new HttpRequestMessage(HttpMethod.Get, _base + "/server/ping");
+        }
+        else
+        {
+            // No visibility or trash filter on purpose: trashed and archived changes matter too.
+            var body = new JsonObject
+            {
+                ["filter"] = new JsonObject { ["updatedAt"] = new JsonObject { ["gt"] = Iso(from) } },
+                ["size"] = ChangePageSize,
+                ["withExif"] = false,
+            };
+            req = new HttpRequestMessage(HttpMethod.Post, _base + "/search/metadata")
+            {
+                Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
+            };
+        }
+
+        using (req)
+        using (var resp = await SendRawAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false))
+        {
+            var serverTime = resp.Headers.Date;
+            if (since == null) return new ChangeBatch(Array.Empty<Asset>(), false, serverTime);
+
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            var assetsEl = doc.RootElement.GetProperty("assets");
+            var items = assetsEl.GetProperty("items").EnumerateArray().Select(ParseAsset).ToList();
+            var more = assetsEl.TryGetProperty("nextCursor", out var nc) && nc.ValueKind == JsonValueKind.String;
+            return new ChangeBatch(items, more, serverTime);
         }
     }
 

@@ -61,8 +61,20 @@ public sealed class AppSettings
     public bool ShowLivePhotoVideos { get; set; } = false;
     public FileNaming Naming { get; set; } = FileNaming.Original;
 
-    public bool CacheLimitEnabled { get; set; } = false;
-    public int CacheLimitGb { get; set; } = 20;
+    /// <summary>Check Immich every few seconds for new, changed and trashed photos.</summary>
+    public bool QuickChecks { get; set; } = true;
+
+    /// <summary>Free downloaded photos that haven't been opened for this many days.</summary>
+    public bool FreeUnusedEnabled { get; set; } = true;
+    public int FreeUnusedDays { get; set; } = 30;
+
+    public bool CacheLimitEnabled { get; set; } = true;
+    public int CacheLimitGb { get; set; } = 10;
+
+    /// <summary>Which settings migrations have run. 0 for files written by version 0.1.0.</summary>
+    public int SettingsVersion { get; set; }
+
+    public const int CurrentSettingsVersion = 2;
 
     [JsonIgnore]
     public bool IsConfigured => !string.IsNullOrWhiteSpace(ServerUrl) && !string.IsNullOrEmpty(ApiKeyProtected);
@@ -143,6 +155,10 @@ internal static class SettingsStore
                 if (loaded != null)
                 {
                     loaded.Views ??= new ViewSettings();
+                    if (Migrate(loaded))
+                    {
+                        try { Save(loaded); } catch (Exception ex) { Log.Warn("Could not save migrated settings", ex); }
+                    }
                     return loaded;
                 }
             }
@@ -151,7 +167,27 @@ internal static class SettingsStore
         {
             Log.Warn("Could not read settings, using defaults", ex);
         }
-        return new AppSettings();
+        return new AppSettings { SettingsVersion = AppSettings.CurrentSettingsVersion };
+    }
+
+    /// <summary>Upgrades settings written by older versions. Returns true if anything changed.</summary>
+    internal static bool Migrate(AppSettings s)
+    {
+        if (s.SettingsVersion >= AppSettings.CurrentSettingsVersion) return false;
+        if (s.SettingsVersion < 2)
+        {
+            // 0.1.0 never freed downloaded photos unless asked. Turn cleanup on for everyone once.
+            if (!s.CacheLimitEnabled)
+            {
+                s.CacheLimitEnabled = true;
+                s.CacheLimitGb = 10;
+            }
+            s.FreeUnusedEnabled = true;
+            s.QuickChecks = true;
+            Log.Info("Settings upgraded: cleanup of unused downloads and quick change checks turned on");
+        }
+        s.SettingsVersion = AppSettings.CurrentSettingsVersion;
+        return true;
     }
 
     public static void Save(AppSettings settings)

@@ -76,6 +76,15 @@ internal sealed class FakeImmich : IImmichClient
     public Task<IReadOnlyList<Person>> GetPeopleAsync(CancellationToken ct = default) => Task.FromResult<IReadOnlyList<Person>>(People);
     public Task<Asset> GetAssetAsync(string id, CancellationToken ct = default) => Task.FromResult(Assets.First(a => a.Id == id));
     public Task<long> GetTotalAssetCountAsync(bool includeArchived, CancellationToken ct = default) => Task.FromResult((long)Assets.Count);
+    public DateTimeOffset ServerNow { get; set; } = new(2026, 10, 30, 12, 0, 0, TimeSpan.Zero);
+    /// <summary>Like Immich: "after" compares at full precision but times come back cut to milliseconds, so edge items repeat.</summary>
+    public int ChangeLimit { get; set; } = 500;
+    public Task<ChangeBatch> GetChangesSinceAsync(DateTimeOffset? since, CancellationToken ct = default)
+    {
+        if (since == null) return Task.FromResult(new ChangeBatch(Array.Empty<Asset>(), false, ServerNow));
+        var hits = Assets.Where(a => a.UpdatedAt >= since.Value).ToList();
+        return Task.FromResult(new ChangeBatch(hits.Take(ChangeLimit).ToList(), hits.Count > ChangeLimit, ServerNow));
+    }
     public Task<Stream> OpenOriginalAsync(string id, long offset, long? endExclusive, CancellationToken ct = default) => throw new NotSupportedException();
     public Task<long?> GetOriginalSizeAsync(string id, CancellationToken ct = default) => Task.FromResult<long?>(4242);
     public Task<byte[]> GetThumbnailAsync(string id, bool large, CancellationToken ct = default) => throw new NotSupportedException();
