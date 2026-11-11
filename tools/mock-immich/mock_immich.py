@@ -6,6 +6,7 @@ A small fake Immich server (v3.3 search API) for testing Immich Tray without a r
 API key: "test-key". Only the endpoints Immich Tray uses are implemented.
 Add/remove assets while it runs with:  POST /mock/add?month=2026-10[&count=N][&name=X]  /  POST /mock/delete?id=<uuid>
   POST /mock/trash?id=<uuid>  /  POST /mock/album-add?album=<name>&id=<uuid>
+Slow down original downloads (like a busy server) with --kbps N or POST /mock/speed?kbps=N (0 = no limit).
 """
 import argparse
 import datetime as dt
@@ -14,6 +15,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +30,7 @@ ALBUMS = {}   # id -> dict(name, owner, assets:set, updatedAt)
 PEOPLE = {}   # id -> dict(name, assets:set)
 MEDIA = []    # list of bytes
 PAGE_SIZE = 1000
+KBPS = 0      # original download speed limit, 0 = unlimited
 
 
 def uid(n):
@@ -247,12 +250,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
-        self.wfile.write(chunk)
+        if KBPS <= 0:
+            self.wfile.write(chunk)
+            return
+        piece = 16 * 1024
+        for i in range(0, len(chunk), piece):
+            self.wfile.write(chunk[i:i + piece])
+            time.sleep(piece / 1024 / KBPS)
 
     def do_POST(self):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path.startswith("/mock/"):
+            if u.path == "/mock/speed":
+                global KBPS
+                KBPS = int(q.get("kbps", "0"))
+                return self.send_json({"kbps": KBPS})
             with lock:
                 if u.path == "/mock/add":
                     y, mo = map(int, q.get("month", "2026-10").split("-"))
@@ -298,13 +311,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global PAGE_SIZE
+    global PAGE_SIZE, KBPS
     ap = argparse.ArgumentParser()
     ap.add_argument("--media", required=True)
     ap.add_argument("--port", type=int, default=2283)
     ap.add_argument("--page-size", type=int, default=1000)
+    ap.add_argument("--kbps", type=int, default=0)
     args = ap.parse_args()
     PAGE_SIZE = args.page_size
+    KBPS = args.kbps
     for name in sorted(os.listdir(args.media)):
         if name.lower().endswith((".jpg", ".jpeg")):
             with open(os.path.join(args.media, name), "rb") as fh:

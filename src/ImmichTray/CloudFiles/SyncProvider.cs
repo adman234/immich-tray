@@ -24,7 +24,9 @@ internal sealed class SyncProvider : IDisposable
 {
     private static volatile SyncProvider? _current;
 
-    private const int ChunkSize = 1024 * 1024;      // must be a multiple of 4096
+    // Pieces handed to Windows as they arrive. Small, so a slow server still makes progress well inside
+    // the 60 second limit Windows allows between transfers (after that it cancels and the app sees an error).
+    private const int ChunkSize = 64 * 1024;        // must be a multiple of 4096
     private const int PlaceholderBatchSize = 1000;
     private static readonly TimeSpan ListingDeadline = TimeSpan.FromSeconds(45);
 
