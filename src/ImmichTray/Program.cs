@@ -47,9 +47,10 @@ internal static class Program
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Log.Error("Unhandled exception", e.ExceptionObject as Exception);
         TaskScheduler.UnobservedTaskException += (_, e) => { Log.Warn("Unobserved task exception", e.Exception); e.SetObserved(); };
 
+        // Exception mode must be set before anything creates a window (newer runtimes do in SetColorMode).
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         ApplicationConfiguration.Initialize();
         Application.SetColorMode(SystemColorMode.System);
-        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
         using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
         using var quitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, QuitEventName);

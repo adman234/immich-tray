@@ -28,6 +28,11 @@ internal sealed class SyncProvider : IDisposable
     // the 60 second limit Windows allows between transfers (after that it cancels and the app sees an error).
     private const int ChunkSize = 64 * 1024;        // must be a multiple of 4096
     private const int PlaceholderBatchSize = 1000;
+    // Files up to this size are downloaded once and shared by every request (see SharedDownload).
+    // Bigger ones (long videos) are fetched per request so they don't need a second copy on disk.
+    private const long SharedDownloadMaxSize = 256L * 1024 * 1024;
+    // A request starting this far past what the shared download has reached gets its own download.
+    private const long SharedDownloadMaxJump = 16L * 1024 * 1024;
     private static readonly TimeSpan ListingDeadline = TimeSpan.FromSeconds(45);
 
     private readonly string _root;
@@ -36,6 +41,8 @@ internal sealed class SyncProvider : IDisposable
     private readonly DirectoryLocks _locks;
     private readonly int _pid = Environment.ProcessId;
     private readonly ConcurrentDictionary<long, ConcurrentDictionary<int, CancellationTokenSource>> _transfers = new();
+    private readonly ConcurrentDictionary<string, SharedDownload> _shared = new(StringComparer.Ordinal);
+    private readonly Dictionary<long, string> _sharedByTransfer = new();
     private readonly ConcurrentDictionary<string, Task<IReadOnlyList<TreeEntry>>> _listings = new(StringComparer.OrdinalIgnoreCase);
     private int _opCounter;
     private long _connectionKey;
@@ -86,6 +93,8 @@ internal sealed class SyncProvider : IDisposable
         if (!IsConnected) return;
         foreach (var ops in _transfers.Values)
             foreach (var cts in ops.Values) cts.Cancel();
+        foreach (var d in _shared.Values) d.Abort();
+        lock (_sharedByTransfer) _sharedByTransfer.Clear();
         var hr = CfDisconnectSyncRoot(_connectionKey);
         if (hr < 0) Log.Warn($"CfDisconnectSyncRoot returned 0x{hr:X8}");
         _connectionKey = 0;
@@ -105,7 +114,13 @@ internal sealed class SyncProvider : IDisposable
     private unsafe static void OnFetchData(CF_CALLBACK_INFO* info, byte* p) => Guard(info, p, (s, r) => s.FetchData(r));
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
-    private unsafe static void OnCancelFetchData(CF_CALLBACK_INFO* info, byte* p) => Guard(info, p, (s, r) => s.CancelFetchData(r));
+    private unsafe static void OnCancelFetchData(CF_CALLBACK_INFO* info, byte* p)
+    {
+        // CF_CALLBACK_PARAMETERS.Cancel.FetchData: FileOffset at 8, Length at 16.
+        var offset = *(long*)(p + 8);
+        var length = *(long*)(p + 16);
+        Guard(info, p, (s, r) => s.CancelFetchData(r, offset, length));
+    }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private unsafe static void OnFetchPlaceholders(CF_CALLBACK_INFO* info, byte* p) => Guard(info, p, (s, r) => s.FetchPlaceholders(r));
@@ -302,6 +317,8 @@ internal sealed class SyncProvider : IDisposable
             return;
         }
 
+        if (fileSize <= SharedDownloadMaxSize && TryShared(r, assetId, fileSize, start, end)) return;
+
         var opId = Interlocked.Increment(ref _opCounter);
         var cts = new CancellationTokenSource();
         _transfers.GetOrAdd(r.TransferKey, _ => new()).TryAdd(opId, cts);
@@ -355,8 +372,45 @@ internal sealed class SyncProvider : IDisposable
         });
     }
 
-    private void CancelFetchData(Request r)
+    /// <summary>
+    /// Serves a request from the one shared download of this photo. False when the request is for a
+    /// part far beyond what has been downloaded (a jump in a video): that gets a download of its own.
+    /// </summary>
+    private bool TryShared(Request r, string assetId, long fileSize, long start, long end)
     {
+        var waiter = new SharedDownload.Waiter(r, r.TransferKey, start & ~4095L, end);
+        for (var i = 0; i < 3; i++)
+        {
+            var d = _shared.GetOrAdd(assetId, id => new SharedDownload(id, fileSize, _client,
+                (w, buf, off, len) => Transfer((Request)w.Request, buf, off, len),
+                w => Fail((Request)w.Request, w.Next, w.End - w.Next),
+                gone =>
+                {
+                    if (!_shared.TryRemove(new KeyValuePair<string, SharedDownload>(gone.AssetId, gone))) return;
+                    lock (_sharedByTransfer)
+                        foreach (var key in _sharedByTransfer.Where(kv => kv.Value == gone.AssetId).Select(kv => kv.Key).ToList())
+                            _sharedByTransfer.Remove(key);
+                },
+                delta => ActiveDownloadsChanged?.Invoke(Interlocked.Add(ref _activeDownloads, delta))));
+            if (d.Size != fileSize)
+            {
+                // The photo changed on the server since this download started.
+                d.Abort();
+                continue;
+            }
+            if (start > d.Have + SharedDownloadMaxJump) return false;
+            lock (_sharedByTransfer) _sharedByTransfer[r.TransferKey] = assetId;
+            if (d.Attach(waiter)) return true;
+        }
+        return false;
+    }
+
+    private void CancelFetchData(Request r, long offset, long length)
+    {
+        string? assetId;
+        lock (_sharedByTransfer) _sharedByTransfer.TryGetValue(r.TransferKey, out assetId);
+        if (assetId != null && _shared.TryGetValue(assetId, out var d)) d.Cancel(r.TransferKey, offset, length);
+
         if (_transfers.TryGetValue(r.TransferKey, out var ops))
             foreach (var cts in ops.Values)
             {
